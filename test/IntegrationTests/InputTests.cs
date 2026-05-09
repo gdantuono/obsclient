@@ -1,4 +1,7 @@
-﻿using OBSStudioClient;
+﻿using IntegrationTests.Services;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Debug;
+using OBSStudioClient;
 using OBSStudioClient.Enums;
 using System.Diagnostics;
 using Xunit.Sdk;
@@ -7,36 +10,21 @@ namespace IntegrationTests;
 
 public class InputTests
 {
-    private ObsClient CreateClient()
-    {
-        ObsClient client = new();
-        client.RequestTimeout = 5000;
-        return client;
-    }
-
-    private async Task ConnectOrThrowAsync(ObsClient client, EventSubscriptions eventSubscription = EventSubscriptions.All)
-    {
-        var result = await client.ConnectAsync(
-            autoReconnect: true, 
-            password: "", 
-            hostname: "localhost", 
-            port: 4449,
-            eventSubscription: eventSubscription);
-        if (!result)
-            throw new XunitException("Failed to connect to OBS WebSocket server.");
-    }
+    private readonly TestService testService = new();
+    readonly string inputText = "chapter@1-content-text";
 
     [Fact]
     public async Task InputVolumeMeters_Test()
     {
         var eventCount = 0;
-        using var client = CreateClient();
+        using var client = testService.CreateClient();
+        client.HighVolumeEventThrottleInterval = TimeSpan.FromMilliseconds(500);
         client.InputVolumeMeters += (sender, e) =>
         {
             Assert.NotNull(e);
             Assert.NotNull(e.Inputs);
             Assert.NotEmpty(e.Inputs);
-            
+
             foreach (var input in e.Inputs)
             {
                 Assert.NotNull(input.InputName);
@@ -54,12 +42,41 @@ public class InputTests
             }
             eventCount++;
         };
-        await ConnectOrThrowAsync(client,
+        await testService.ConnectOrThrowAsync(client,
                 eventSubscription: OBSStudioClient.Enums.EventSubscriptions.All
                 | OBSStudioClient.Enums.EventSubscriptions.InputVolumeMeters);
-        await Task.Delay(600);
-        Assert.True(eventCount > 3, "Expected to receive at least 10 InputVolumeMeters events within 600 milliseconds.");
+        await Task.Delay(1600);
+        Assert.True(eventCount > 3, "Expected to receive at least 3 InputVolumeMeters events");
     }
 
+    [Fact]
+    public async Task GetInputSettings_Test()
+    {
+        using var client = testService.CreateClient();
+        client.RequestTimeout = 500;
+        await testService.ConnectOrThrowAsync(client,
+            eventSubscription: OBSStudioClient.Enums.EventSubscriptions.All
+                | OBSStudioClient.Enums.EventSubscriptions.InputVolumeMeters);
 
+        var timeoutCounter = 0;
+        var successCounter = 0;
+        await Parallel.ForEachAsync(Enumerable.Range(0, 10), async (i, ct) =>
+        {
+            try
+            {
+                await client.GetInputSettings(inputText);
+                Interlocked.Increment(ref successCounter);
+                await Task.Delay(600);
+            }
+            catch (TimeoutException)
+            {
+                Interlocked.Increment(ref timeoutCounter);
+                await Task.Delay(1000);
+            }
+        });
+        client.Disconnect();
+        await testService.ConnectOrThrowAsync(client);
+        await client.GetInputSettings(inputText);
+        Assert.True(timeoutCounter == 0, $"Expected no timeouts, but got {timeoutCounter} timeouts.");
+    }
 }

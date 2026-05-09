@@ -84,10 +84,24 @@
 
         private readonly ConcurrentDictionary<string, DateTime> _eventThrottleMap = new();
 
-        private readonly TimeSpan _highVolumeEventThrottleInterval = TimeSpan.FromMilliseconds(100);
+        private TimeSpan _highVolumeEventThrottleInterval = TimeSpan.FromMilliseconds(100);
 
         private Task? _receiverTask;
 
+        /// <summary>
+        /// Gets or sets the interval for throttling high-frequency events. When a high-frequency event is received, the client will check when the last event of the same type was received. If it was received within the specified interval, the event will be ignored. This can help to reduce CPU usage and improve performance when receiving a large number of events in a short period of time.
+        /// </summary>
+        public TimeSpan HighVolumeEventThrottleInterval
+        {
+            get => _highVolumeEventThrottleInterval;
+            set
+            {
+                if (value < TimeSpan.Zero)
+                    throw new ArgumentOutOfRangeException(nameof(HighVolumeEventThrottleInterval), "Value must be non-negative.");
+                _highVolumeEventThrottleInterval = value;
+                _eventThrottleMap.Clear(); // Clear throttle map to reset timing for all events
+            }
+        }
         /// <summary>
         /// Gets or sets the maximum amount of time, in milliseconds, the <see cref="ObsClient"/> to wait for an OBS Studio response after making a request.
         /// </summary>
@@ -210,7 +224,7 @@
         /// <remarks>
         /// You will not be notified through the PropertyChanged event when this value changes.
         /// </remarks>
-        public int TotalMessagesReceived => this._totalMessagesReceived;            
+        public int TotalMessagesReceived => this._totalMessagesReceived;
 
         /// <summary>
         /// Gets the number of bytes sent to OBS Studio.
@@ -218,7 +232,7 @@
         /// <remarks>
         /// You will not be notified through the PropertyChanged event when this value changes.
         /// </remarks>
-        public long SessionBytesSent => this._sessionBytesSent; 
+        public long SessionBytesSent => this._sessionBytesSent;
 
         /// <summary>
         /// Gets the number of bytes received from OBS Studio in the current session.
@@ -299,7 +313,7 @@
         /// Occurs when the number of bytes sent changes.
         /// </summary>
         public event EventHandler<long>? TotalBytesSentChanged;
-        
+
         /// <summary>
         /// Occurs when the number of bytes received changes.
         /// </summary>
@@ -422,17 +436,55 @@
         /// <param name="hostname">The hostname of the computer running OBS Studio to connect to. Defaults to "localhost".</param>
         /// <param name="port">The Port on which the OBS Studio WebSocket interface is listenting. Default to 4455.</param>
         /// <param name="eventSubscription">The events to subscribe to. Defaults to All events.</param>
+        /// <param name="connectionString">The connection string to use for connecting to OBS Studio. Defaults to null. Example: "Host=localhost;Port=4449;Password=mypassword;Events=InputVolumeMeters"</param>
         /// <returns>True, when the connection was succesfully established, and False otherwise.</returns>
         /// <remarks>
         /// When True is returned, this does not mean that authentication has succeeded. Authentication will be handled asynchronously.
         /// You can use the <see cref="PropertyChanged"/> event to see whether the <see cref="ConnectionState"/> is Connected, which indicates succesfull authenticaiton.
         /// When the client is already connected, disconnect first.
         /// </remarks>
-        public async Task<bool> ConnectAsync(bool autoReconnect = false, string password = "", string hostname = "localhost", int port = 4455, EventSubscriptions eventSubscription = EventSubscriptions.All)
+        public async Task<bool> ConnectAsync(bool autoReconnect = false, string? password = "", string? hostname = "localhost", int? port = 4455, EventSubscriptions eventSubscription = EventSubscriptions.All, string? connectionString = null)
         {
-            if (this._connectionState != ConnectionState.Disconnected)
+            if (connectionString != null)
             {
-                return true;
+                try
+                {
+                    var parameters = connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                           .Select(part => part.Split('=', 2))
+                           .Where(parts => parts.Length == 2)
+                           .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim(), StringComparer.OrdinalIgnoreCase);
+                    if (parameters.TryGetValue("host", out var host))
+                    {
+                        hostname = host;
+                    }
+                    if (parameters.TryGetValue("port", out var portStr) && int.TryParse(portStr, out var parsedPort))
+                    {
+                        port = parsedPort;
+                    }
+                    if (parameters.TryGetValue("password", out var pwd))
+                    {
+                        password = pwd;
+                    }
+                    if (parameters.TryGetValue("events", out var eventsStr) && Enum.TryParse<EventSubscriptions>(eventsStr, true, out var parsedEvents))
+                    {
+                        //FUTURE: Consider supporting multiple events separated by comma, e.g. "All,Scenes,Inputs"
+                        eventSubscription = parsedEvents;
+                    }
+                    if (parameters.TryGetValue("autoReconnect", out var autoReconnectStr) && bool.TryParse(autoReconnectStr, out var parsedAutoReconnect))
+                    {
+                        autoReconnect = parsedAutoReconnect;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error parsing connection string: {ConnectionString}", connectionString);
+                    throw new ObsClientException($"Invalid connection string format {connectionString}");
+                }
+            }
+
+            if (port == null)
+            {
+                throw new ArgumentNullException(nameof(port), "Port number must be between 1 and 65534.");
             }
 
             if (port is < 1 or > 65534)
@@ -442,12 +494,14 @@
 
             if (!Uri.TryCreate($"ws://{hostname}:{port}", UriKind.Absolute, out Uri? uri))
             {
-                throw new ArgumentException("Invalid hostname.", nameof(hostname));
+                throw new ArgumentException($"Invalid hostname {hostname}.", nameof(hostname));
             }
+
+            await EnsureDisconnectionAsync(timeoutInMilliseconds: 5000).ConfigureAwait(false);
 
             this.AutoReconnect = autoReconnect;
             this._uri = uri;
-            this._password = password;
+            this._password = password ?? string.Empty;
             this._eventSubscriptions = eventSubscription;
 
             // Dispose previous token before creating a new one
@@ -455,7 +509,7 @@
             this._receiver = new CancellationTokenSource();
             this._authenticationComplete = new();
 
-            _logger.LogInformation("Connected to {Hostname}:{Port}", hostname, port);
+            _logger.LogDebug("Connecting to {Hostname}:{Port}", hostname, port);
 
             return await this.StartAsync().ConfigureAwait(false);
         }
@@ -465,7 +519,8 @@
         /// </summary>
         public void Disconnect()
         {
-            _logger.LogInformation("Disconnecting from OBS Studio");
+            _logger.LogDebug("Disconnecting from {Host}:{Port}", _uri.Host, _uri.Port);
+            this.ConnectionState = ConnectionState.Disconnecting;
             this.AutoReconnect = false;
             this._receiver.Cancel();
         }
@@ -580,14 +635,14 @@
             }
 
             if (this._client?.State == WebSocketState.Open)
-            {    
+            {
                 // Ensure previous receiver is completed
                 if (_receiverTask != null && !_receiverTask.IsCompleted)
                 {
                     try { await _receiverTask; } catch { /* ignore exceptions */ }
                 }
 
-                _receiverTask = Task.Run(() => this.ReceiverAsync(this._receiver.Token));
+                _receiverTask = Task.Run(() => this.ReceiverAsync(this._receiver.Token), this._receiver.Token);
                 return await this._authenticationComplete.Task.ConfigureAwait(false);
             }
             else
@@ -641,7 +696,7 @@
         {
             if (responseMessage.Data is RequestResponseMessage requestResponseData)
             {
-                if (this._requests.TryGetValue(requestResponseData.RequestId, out var tcs))
+                if (this._requests.TryRemove(requestResponseData.RequestId, out var tcs))
                 {
                     tcs.SetResult(requestResponseData);
                 }
@@ -652,7 +707,7 @@
             }
         }
 
-        private void ProcessEventMessage(ObsMessage responseMessage)
+        private void ProcessEventMessage(string responseRaw, ObsMessage responseMessage)
         {
             if (responseMessage.Data is EventMessage eventResponseData)
             {
@@ -662,14 +717,15 @@
                 if (IsHighFrequencyEvent(eventResponseData.EventType))
                 {
                     var now = DateTime.UtcNow;
-                    _eventThrottleMap.AddOrUpdate(
+                    var time = _eventThrottleMap.AddOrUpdate(
                         eventType,
                         now,
                         (key, lastTime) => (now - lastTime) < _highVolumeEventThrottleInterval ? lastTime : now
                     );
-                    if ((_eventThrottleMap[eventType] != now))
+                    if (time != now)
                         return; // Skip invocation
                 }
+                Debug.WriteLine($"Received: {responseRaw}");
 
                 if (this._eventsMap.TryGetValue(eventType, out var field) && field.GetValue(this) is MulticastDelegate eventDelegate)
                 {
@@ -710,7 +766,7 @@
         {
             if (responseMessage.Data is RequestBatchResponseMessage requestBatchResponseData)
             {
-                if (this._requests.TryGetValue(requestBatchResponseData.RequestId, out var tcs))
+                if (this._requests.TryRemove(requestBatchResponseData.RequestId, out var tcs))
                 {
                     tcs.SetResult(requestBatchResponseData);
                 }
@@ -729,11 +785,15 @@
             }
 
             var response = responseBuilder.ToString();
-            _logger.LogDebug("Received: {Response}", response);
-            Debug.WriteLine($"Received: {response}");
+
             if (JsonSerializer.Deserialize<ObsMessage>(response) is not ObsMessage message)
             {
+                _logger.LogDebug("Received: {Response}", response);
                 throw new ObsClientException($"Could not read message from OBS Studio.");
+            }
+            else if (message.Op != OpCode.Event)
+            {
+                Debug.WriteLine($"Received: {response}");
             }
 
             switch (message.Op)
@@ -748,7 +808,7 @@
                     this.ProcessRequestResponseMessage(message);
                     break;
                 case OpCode.Event:
-                    this.ProcessEventMessage(message);
+                    this.ProcessEventMessage(response, message);
                     break;
                 case OpCode.RequestBatchResponse:
                     this.ProcessRequestBatchResponseMessage(message);
@@ -812,16 +872,12 @@
                         StringBuilderCache.Release(responseBuilder);
                     }
                 }
-
-                await this.CloseConnectionAsync(ct).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) { }
             finally
             {
-                if (_client.State != WebSocketState.None)
-                {
-                    _client.Dispose();
-                    _client = new ClientWebSocket();
-                }
+                await this.CloseConnectionAsync(ct).ConfigureAwait(false);
+                
 
                 bufferPool.Return(receiveBuffer);
 
@@ -868,11 +924,13 @@
         {
             WebSocketCloseCode closeCode;
             string closeDescription;
+            var ctChain = ct;
             if (ct.IsCancellationRequested)
             {
                 // Closed the connection because you called Disconnect().
                 closeCode = WebSocketCloseCode.NormalClosure;
                 closeDescription = "Disconnecting due to request.";
+                ctChain = CancellationToken.None;
             }
             else
             {
@@ -884,11 +942,9 @@
             if (this._client.State == WebSocketState.Open || this._client.State == WebSocketState.CloseReceived)
             {
                 this.ConnectionState = ConnectionState.Disconnecting;
-                await this._client.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, ct).ConfigureAwait(false);
+                await this._client.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, ctChain).ConfigureAwait(false);
             }
 
-            this.ConnectionState = ConnectionState.Disconnected;
-            _ = Task.Run(() => this.ConnectionClosed?.Invoke(this, new ConnectionClosedEventArgs(closeCode, closeDescription)), ct);
             Interlocked.Exchange(ref this._sessionBytesReceived, 0);
             Interlocked.Exchange(ref this._sessionBytesSent, 0);
             Interlocked.Exchange(ref this._sessionMessagesReceived, 0);
@@ -897,14 +953,85 @@
             {
                 this._authenticationComplete.SetResult(false);
             }
+            if (_client.State != WebSocketState.None)
+            {
+                _client.Dispose();
+                _client = new ClientWebSocket();
+            }
+            this.ConnectionState = ConnectionState.Disconnected;
+            _ = Task.Run(() => this.ConnectionClosed?.Invoke(this, new ConnectionClosedEventArgs(closeCode, closeDescription)), ctChain);
+            _logger.LogInformation("Connection closed {Host}:{Port}. Code: {CloseCode}, Description: {CloseDescription}", _uri.Host, _uri.Port, closeCode, closeDescription);
+        }
+
+        /// <summary>
+        /// Ensures that the connection state is Disconnected, waiting for it to become Disconnected if it is currently Disconnecting. Throws an exception if the connection state is Connecting, Authenticating or Connected, or if the timeout is reached while waiting for the state to become Disconnected.
+        /// </summary>
+        public async Task EnsureDisconnectionAsync(int? timeoutInMilliseconds = null)
+        {
+            int effectiveTimeout = timeoutInMilliseconds ?? this._requestTimeout;
+            int elapsed = 0;
+
+            while (true)
+            {
+                ConnectionState currentState = ConnectionState;
+                if (currentState == ConnectionState.Disconnected)
+                {
+                    return;
+                }
+
+                if (currentState is not (ConnectionState.Disconnecting))
+                {
+                    throw new ObsClientException($"Already connected. Current state: {currentState}.");
+                }
+
+                if (elapsed >= effectiveTimeout)
+                {
+                    throw new ObsClientException(
+                        $"Already connected. Timeout waiting for connection state to become Disconnected. Current state: {currentState}.");
+                }
+
+                int delay = Math.Min(this._requestRetryInterval, effectiveTimeout - elapsed);
+                await Task.Delay(delay).ConfigureAwait(false);
+                elapsed += delay;
+            }
+        }
+
+        /// <summary>
+        /// Ensure that the connection state is Connected, waiting for it to become Connected if it is currently Connecting or Authenticating. Throws an exception if the connection state is Disconnected or Disconnecting, or if the timeout is reached while waiting for the state to become Connected.
+        /// </summary>
+        private async Task EnsureConnectionAsync(int? timeoutInMilliseconds = null)
+        {
+            int effectiveTimeout = timeoutInMilliseconds ?? this._requestTimeout;
+            int elapsed = 0;
+
+            while (true)
+            {
+                ConnectionState currentState = ConnectionState;
+                if (currentState == ConnectionState.Connected)
+                {
+                    return;
+                }
+
+                if (currentState is not (ConnectionState.Connecting or ConnectionState.Authenticating))
+                {
+                    throw new ObsClientException($"Not connected. Current state: {currentState}.");
+                }
+
+                if (elapsed >= effectiveTimeout)
+                {
+                    throw new ObsClientException(
+                        $"Not connected. Timeout waiting for connection state to become Connected. Current state: {currentState}.");
+                }
+
+                int delay = Math.Min(this._requestRetryInterval, effectiveTimeout - elapsed);
+                await Task.Delay(delay).ConfigureAwait(false);
+                elapsed += delay;
+            }
         }
 
         private async Task<IMessage> SendAndWaitAsync(dynamic request, int? timeout = null)
         {
-            if (this._connectionState != ConnectionState.Connected)
-            {
-                throw new ObsClientException("Not connected.");
-            }
+            await EnsureConnectionAsync(timeout).ConfigureAwait(false);
 
             string requestId = request.d.requestId;
             TaskCompletionSource<IMessage> tcs = new();
@@ -992,6 +1119,7 @@
         {
             if (this._autoReconnect && this._connectionState == ConnectionState.Disconnected)
             {
+                _logger.LogInformation("AutoReconnect: detect disconnected state, attempting to reconnect...");
                 this.ConnectionState = ConnectionState.Connecting;
                 _ = Task.Run(async () =>
                 {
@@ -1001,7 +1129,7 @@
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Reconnect failed");
+                        _logger.LogError(ex, "AutoReconnect: reconnect failed");
                     }
                 });
             }

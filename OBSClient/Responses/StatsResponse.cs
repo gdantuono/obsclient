@@ -24,13 +24,13 @@
     /// Provides the Response Data (<see cref="IResponse"/>) in the Response Message (<see cref="IMessage"/>) returned by OBS Studio after sending a successful GetStats request.
     /// </summary>
     [method: JsonConstructor]
-    public class StatsResponse(float cpuUsage, float memoryUsage, float availableDiskSpace, float activeFps, float averageFrameRenderTime, long renderSkippedFrames, long renderTotalFrames, long outputSkippedFrames, long outputTotalFrames, long webSocketSessionIncomingMessages, long webSocketSessionOutgoingMessages) : IResponse
+    public class StatsResponse(float? cpuUsage, float memoryUsage, float availableDiskSpace, float activeFps, float averageFrameRenderTime, long renderSkippedFrames, long renderTotalFrames, long outputSkippedFrames, long outputTotalFrames, long webSocketSessionIncomingMessages, long webSocketSessionOutgoingMessages) : IResponse
     {
         /// <summary>
         /// Gets the current CPU usage is percent.
         /// </summary>
         [JsonPropertyName("cpuUsage")]
-        public float CpuUsage { get; } = cpuUsage;
+        public float? CpuUsage { get; } = cpuUsage;
 
         /// <summary>
         /// Gets the amount of memory in MB currently being used by OBS Studio.
